@@ -176,6 +176,175 @@ const getState = async () => (await call('GET', '/api/state')).json;
   r = await call('DELETE', `/api/artworks/${newId}`, { version: r.json.version });
   ok(r.status === 200 && !r.json.artworks.some((a) => a.id === newId), '未被引用的作品可删除');
 
+  console.log('# 12. 多段照度结算 / 更正（进行中→结束→更正）');
+  // 干净基线：清空排期后录入两件作品、一个进行中时段
+  st = await getState();
+  const before = st.version;
+  // 用一个全新作品构造独立场景，避免影响前文数据
+  r = await call('POST', '/api/artworks', { version: st.version, name: '多段测试品', limit: 100000, existing: 0 });
+  ok(r.status === 200, '录入多段测试作品');
+  st = r.json;
+  const artId = st.artworks.at(-1).id;
+  let ver = st.version;
+
+  r = await call('POST', '/api/schedule', { version: ver, slots: [
+    { cid: 'ms1', hall: '多段厅', start: '2026-11-10T09:00', end: '2026-11-10T13:00', lux: 200, artworkIds: [artId] },
+  ]});
+  ok(r.status === 200, '排入一个未开始时段');
+  ver = r.json.version;
+  const slotId = r.json.slots.find((s) => s.hall === '多段厅').id;
+  r = await call('POST', `/api/slots/${slotId}/start`);
+  ok(r.status === 200, '启动该时段');
+  ver = r.json.version;
+
+  // 12a. 无 version → 409
+  r = await call('POST', `/api/slots/${slotId}/settle`, { segments: [
+    { start: '2026-11-10T09:00', end: '2026-11-10T13:00', lux: 200 },
+  ]});
+  ok(r.status === 409 && r.json.error?.code === 'VERSION_STALE', '多段结算缺版本号返回 409 与最新预算');
+
+  // 12b. 分段有缺口 → 422，整批拒绝、版本不变
+  r = await call('POST', `/api/slots/${slotId}/settle`, { version: ver, segments: [
+    { start: '2026-11-10T09:00', end: '2026-11-10T10:00', lux: 200 },
+    { start: '2026-11-10T10:30', end: '2026-11-10T13:00', lux: 300 },
+  ]});
+  ok(r.status === 422 && r.json.error?.code === 'SEGMENTS_INVALID' && r.json.errors.length >= 1,
+     `分段有缺口被整批拒绝（${r.json.errors?.[0]}）`);
+  st = await getState();
+  ok(st.version === ver && st.slots.find((s) => s.id === slotId).status === 'running',
+     '被拒绝后时段仍为进行中、版本不变');
+
+  // 12c. 重叠 + 负照度 + 空数组
+  r = await call('POST', `/api/slots/${slotId}/settle`, { version: ver, segments: [
+    { start: '2026-11-10T09:00', end: '2026-11-10T11:00', lux: 200 },
+    { start: '2026-11-10T10:00', end: '2026-11-10T13:00', lux: 300 },
+  ]});
+  ok(r.status === 422 && r.json.errors.some((m) => m.includes('重叠')), '分段重叠被拒绝');
+  r = await call('POST', `/api/slots/${slotId}/settle`, { version: ver, segments: [
+    { start: '2026-11-10T09:00', end: '2026-11-10T13:00', lux: -5 },
+  ]});
+  ok(r.status === 422, '负照度段被拒绝');
+  r = await call('POST', `/api/slots/${slotId}/settle`, { version: ver, segments: [] });
+  ok(r.status === 422, '空分段被拒绝');
+
+  // 12d. 显式 actualStart/actualEnd：分段未覆盖到实际结束 → 422
+  r = await call('POST', `/api/slots/${slotId}/settle`, {
+    version: ver,
+    actualStart: '2026-11-10T08:30',
+    actualEnd: '2026-11-10T12:30',
+    segments: [
+      { start: '2026-11-10T08:30', end: '2026-11-10T10:30', lux: 200 },
+      { start: '2026-11-10T10:30', end: '2026-11-10T13:00', lux: 300 },
+    ],
+  });
+  ok(r.status === 422 && r.json.errors.some((m) => m.includes('实际结束')), '分段未覆盖到显式实际结束被拒绝');
+
+  // 12e. 乱序提交两段，服务端排序后按 Σ 结算：60*200 + 180*300 = 66000
+  r = await call('POST', `/api/slots/${slotId}/settle`, {
+    version: ver,
+    actualStart: '2026-11-10T08:30',
+    actualEnd: '2026-11-10T12:30',
+    segments: [
+      { start: '2026-11-10T09:30', end: '2026-11-10T12:30', lux: 300 },
+      { start: '2026-11-10T08:30', end: '2026-11-10T09:30', lux: 200 },
+    ],
+  });
+  ok(r.status === 200 && r.json.justFinishedExposure === 66000,
+     `乱序多段结算 Σ=66000（得到 ${r.json.justFinishedExposure}）`);
+  ver = r.json.version;
+  let settled = r.json.slots.find((s) => s.id === slotId);
+  ok(settled.status === 'finished' && settled.actualLux === null && settled.actualStart === '2026-11-10T08:30'
+     && settled.actualSegments.length === 2 && settled.actualSegments[0].start === '2026-11-10T08:30',
+     '结算后为已结束、actualLux 为 null（多段）、分段按时间升序返回');
+  let art = r.json.artworks.find((a) => a.id === artId);
+  ok(art.used === 66000, `作品已用量按新总量计入（used=${art.used}）`);
+
+  // 12f. 对已结束时段再 settle → 422
+  r = await call('POST', `/api/slots/${slotId}/settle`, { version: ver, segments: [
+    { start: '2026-11-10T08:30', end: '2026-11-10T12:30', lux: 100 },
+  ]});
+  ok(r.status === 422 && r.json.error?.code === 'NOT_RUNNING', '已结束时段不能再 settle');
+
+  // 12g. 更正：无理由拒绝 / 版本过期拒绝
+  r = await call('POST', `/api/slots/${slotId}/correct`, { version: ver, segments: [
+    { start: '2026-11-10T08:30', end: '2026-11-10T12:30', lux: 100 },
+  ]});
+  ok(r.status === 422, '更正缺理由被拒绝');
+  r = await call('POST', `/api/slots/${slotId}/correct`, {
+    version: ver - 1, reason: 'x', segments: [
+      { start: '2026-11-10T08:30', end: '2026-11-10T12:30', lux: 100 },
+    ],
+  });
+  ok(r.status === 409 && r.json.state.version === ver, '更正过期版本返回 409 与最新预算');
+
+  // 12h. 合法更正：两段 120*100 + 120*150 = 30000，区间沿用原值
+  r = await call('POST', `/api/slots/${slotId}/correct`, {
+    version: ver,
+    reason: '测光表复核：上午 100 lux，午后 150 lux',
+    segments: [
+      { start: '2026-11-10T08:30', end: '2026-11-10T10:30', lux: 100 },
+      { start: '2026-11-10T10:30', end: '2026-11-10T12:30', lux: 150 },
+    ],
+  });
+  ok(r.status === 200 && r.json.beforeExposure === 66000 && r.json.afterExposure === 30000,
+     `更正成功：${r.json.beforeExposure} → ${r.json.afterExposure}`);
+  ver = r.json.version;
+  settled = r.json.slots.find((s) => s.id === slotId);
+  art = r.json.artworks.find((a) => a.id === artId);
+  ok(art.used === 30000, '更正后作品已用量按新总量替换，不重复累计');
+  ok(settled.actualExposure === 30000 && settled.corrections.length === 1
+     && settled.corrections[0].beforeExposure === 66000 && settled.corrections[0].afterExposure === 30000
+     && settled.corrections[0].beforeSegments.length === 2 && settled.corrections[0].afterSegments.length === 2,
+     '时段记录更正流水（前后曝光、前后分段快照）');
+
+  // 12i. 再次更正：覆盖实际区间，单段（actualLux 恢复为数值）
+  r = await call('POST', `/api/slots/${slotId}/correct`, {
+    version: ver,
+    reason: '补录：实际提前撤展，09:30 结束，全程 120 lux',
+    actualStart: '2026-11-10T08:30',
+    actualEnd: '2026-11-10T09:30',
+    segments: [
+      { start: '2026-11-10T08:30', end: '2026-11-10T09:30', lux: 120 },
+    ],
+  });
+  ok(r.status === 200 && r.json.afterExposure === 7200, `覆盖区间更正成功（after=${r.json.afterExposure}）`);
+  ver = r.json.version;
+  settled = r.json.slots.find((s) => s.id === slotId);
+  art = r.json.artworks.find((a) => a.id === artId);
+  ok(settled.actualStart === '2026-11-10T08:30' && settled.actualEnd === '2026-11-10T09:30'
+     && settled.actualLux === 120 && settled.actualExposure === 7200 && art.used === 7200,
+     '单段更正后 actualLux 有值、作品已用量随之替换');
+  ok(settled.corrections.length === 2, '累计两条更正记录');
+
+  // 12j. 更正失败不改版本、不改结算
+  r = await call('POST', `/api/slots/${slotId}/correct`, {
+    version: ver, reason: '坏数据', segments: [
+      { start: '2026-11-10T08:30', end: '2026-11-10T09:00', lux: 120 },
+      { start: '2026-11-10T09:10', end: '2026-11-10T09:30', lux: 120 },
+    ],
+  });
+  ok(r.status === 422, '不衔接的更正分段被拒绝');
+  st = await getState();
+  ok(st.version === ver && st.slots.find((s) => s.id === slotId).actualExposure === 7200,
+     '更正被拒绝后版本与结算均不变');
+
+  // 12k. 旧单一照度 finish 仍可用，且同样生成单段明细
+  r = await call('POST', '/api/schedule', { version: st.version, slots: [
+    { cid: 'legacy', hall: '旧接口厅', start: '2026-12-01T09:00', end: '2026-12-01T10:00', lux: 50, artworkIds: [artId] },
+  ]});
+  ok(r.status === 200, '为旧接口测试排入时段');
+  const legacyId = r.json.slots.find((s) => s.hall === '旧接口厅').id;
+  r = await call('POST', `/api/slots/${legacyId}/start`);
+  ok(r.status === 200, '旧接口时段启动');
+  r = await call('POST', `/api/slots/${legacyId}/finish`, {
+    actualStart: '2026-12-01T09:00', actualEnd: '2026-12-01T10:00', actualLux: 55,
+  });
+  ok(r.status === 200 && r.json.justFinishedExposure === 3300 && r.json.blockedAfterFinish !== undefined,
+     `旧 POST /finish 语义保持可用（exposure=${r.json.justFinishedExposure}）`);
+  settled = r.json.slots.find((s) => s.id === legacyId);
+  ok(settled.actualLux === 55 && settled.actualSegments.length === 1 && settled.actualSegments[0].exposure === 3300,
+     '旧接口结算同样落一条分段明细');
+
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

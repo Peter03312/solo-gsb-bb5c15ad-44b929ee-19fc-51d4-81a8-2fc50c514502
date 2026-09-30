@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS slots (
   planned_start TEXT NOT NULL,
   planned_end TEXT NOT NULL,
   planned_lux REAL NOT NULL CHECK (planned_lux >= 0),
-  -- 结束时补记的实际值
+  -- 结束时补记的实际值（actual_lux 仅在单一照度结算时有值；多段结算见 slot_segments）
   actual_start TEXT,
   actual_end TEXT,
   actual_lux REAL,
@@ -46,6 +46,35 @@ CREATE TABLE IF NOT EXISTS slots (
   blocked_reason TEXT NOT NULL DEFAULT '{}'
 );
 
+-- 实际照度分段：实际照度随时间变化时，按段记录起止与照度，曝光 = Σ(段分钟 × 段照度)
+-- 同一时段的分段须首尾衔接、无重叠并完整覆盖 slots.actual_start ~ actual_end。
+CREATE TABLE IF NOT EXISTS slot_segments (
+  slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+  seg_index INTEGER NOT NULL,              -- 段序号（按开始时间升序，0 起）
+  start_time TEXT NOT NULL,
+  end_time TEXT NOT NULL,
+  lux REAL NOT NULL CHECK (lux >= 0),
+  exposure REAL NOT NULL CHECK (exposure >= 0),
+  PRIMARY KEY (slot_id, seg_index)
+);
+
+-- 已结束时段的完整分段更正记录（审计流水）：新总量替换旧总量，不重复累计
+CREATE TABLE IF NOT EXISTS slot_corrections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  before_start TEXT NOT NULL,
+  before_end TEXT NOT NULL,
+  before_exposure REAL NOT NULL,
+  after_start TEXT NOT NULL,
+  after_end TEXT NOT NULL,
+  after_exposure REAL NOT NULL,
+  before_segments TEXT NOT NULL DEFAULT '[]',  -- 更正前分段 JSON 快照
+  after_segments TEXT NOT NULL DEFAULT '[]'    -- 更正后分段 JSON 快照
+);
+CREATE INDEX IF NOT EXISTS idx_slot_corrections_slot ON slot_corrections(slot_id, id);
+
 -- 时段 <-> 作品（一个时段可同时展出多件作品，同照度下分别计入各作品）
 CREATE TABLE IF NOT EXISTS slot_artworks (
   slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
@@ -53,6 +82,29 @@ CREATE TABLE IF NOT EXISTS slot_artworks (
   PRIMARY KEY (slot_id, artwork_id)
 );
 `;
+
+function backfillSegments(db) {
+  // 旧库兼容：已结束但没有分段记录的时段（历史单一照度结算 / 演示数据），补一段等值分段。
+  const rows = db.prepare(`
+    SELECT s.id, s.actual_start, s.actual_end, s.actual_lux, s.actual_exposure
+    FROM slots s
+    LEFT JOIN slot_segments g ON g.slot_id = s.id
+    WHERE s.status = 'finished' AND g.slot_id IS NULL
+    GROUP BY s.id
+  `).all();
+  if (!rows.length) return;
+  const ins = db.prepare(`
+    INSERT INTO slot_segments (slot_id, seg_index, start_time, end_time, lux, exposure)
+    VALUES (?, 0, ?, ?, ?, ?)
+  `);
+  const tx = db.transaction(() => {
+    for (const r of rows) {
+      if (!r.actual_start || !r.actual_end) continue;
+      ins.run(r.id, r.actual_start, r.actual_end, r.actual_lux ?? 0, r.actual_exposure ?? 0);
+    }
+  });
+  tx.immediate();
+}
 
 function openDb() {
   if (DB_PATH !== ':memory:') {
@@ -62,6 +114,7 @@ function openDb() {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
+  backfillSegments(db);
   return db;
 }
 

@@ -176,6 +176,200 @@ const getState = async () => (await call('GET', '/api/state')).json;
   r = await call('DELETE', `/api/artworks/${newId}`, { version: r.json.version });
   ok(r.status === 200 && !r.json.artworks.some((a) => a.id === newId), '未被引用的作品可删除');
 
+  // ---------- 本轮：多段照度结算（进行中时段） ----------
+  console.log('# 12. 多段结算：版本、分段校验（缺口/重叠/未覆盖整批拒绝）');
+  st = await getState();
+  // 此时段 6（原 s2，一号厅 09-30）在 #8 已被单一照度结算为 finished；另找一个进行中时段：
+  // #9 启动的是 10-01 的 W1 时段（#9 后又被 #10 等改动）。直接重建排期并启动一条新时段。
+  r = await call('POST', '/api/schedule', { version: st.version, slots: [
+    { cid: 'm1', hall: '六号厅', start: '2026-10-15T10:00', end: '2026-10-15T12:00', lux: 100, artworkIds: [3] },
+  ]});
+  ok(r.status === 200, '排入多段结算用时段');
+  const mSlotId = r.json.slots.find((s) => s.plannedStart.startsWith('2026-10-15')).id;
+  r = await call('POST', `/api/slots/${mSlotId}/start`);
+  ok(r.status === 200, '多段结算用时段已启动');
+  const vStarted = r.json.version;
+
+  // 12.1 缺/错版本 -> 409 + 最新预算
+  r = await call('POST', `/api/slots/${mSlotId}/settle`, {
+    actualStart: '2026-10-15T10:00', actualEnd: '2026-10-15T12:00',
+    segments: [{ start: '2026-10-15T10:00', end: '2026-10-15T12:00', lux: 100 }],
+  });
+  ok(r.status === 409 && r.json.error?.code === 'VERSION_STALE' && r.json.state.version === vStarted,
+     '多段结算缺版本返回 409 与最新预算');
+
+  // 12.2 分段不合法（缺口 + 重叠 + 未覆盖 + 负照度）整批拒绝
+  r = await call('POST', `/api/slots/${mSlotId}/settle`, {
+    version: vStarted,
+    actualStart: '2026-10-15T10:00', actualEnd: '2026-10-15T12:00',
+    segments: [
+      { start: '2026-10-15T10:00', end: '2026-10-15T11:00', lux: 200 },
+      { start: '2026-10-15T11:30', end: '2026-10-15T11:40', lux: 100 },
+      { start: '2026-10-15T11:00', end: '2026-10-15T11:50', lux: -5 },
+    ],
+  });
+  ok(r.status === 422 && r.json.error?.code === 'SEGMENTS_INVALID' && r.json.errors?.length >= 3,
+     `分段缺口/重叠/未覆盖/负值整批拒绝（${r.json.errors?.length} 条错误）`);
+  st = await getState();
+  ok(st.version === vStarted && st.slots.find((s) => s.id === mSlotId).status === 'running',
+     '分段被拒后结算与版本均不变');
+
+  // 12.3 合法两段：60×200 + 60×80 = 16800
+  r = await call('POST', `/api/slots/${mSlotId}/settle`, {
+    version: vStarted,
+    actualStart: '2026-10-15T10:00', actualEnd: '2026-10-15T12:00',
+    segments: [
+      { start: '2026-10-15T10:00', end: '2026-10-15T11:00', lux: 200 },
+      { start: '2026-10-15T11:00', end: '2026-10-15T12:00', lux: 80 },
+    ],
+  });
+  ok(r.status === 200 && r.json.justFinishedExposure === 16800, `多段结算成功，总量 ${r.json.justFinishedExposure}`);
+  const settled = r.json.slots.find((s) => s.id === mSlotId);
+  ok(settled.status === 'finished' && settled.actualSegments.length === 2 &&
+     settled.actualSegments[0].exposure === 12000 && settled.actualSegments[1].exposure === 4800,
+     '返回两段明细（分钟×照度）且首尾衔接完整覆盖');
+  ok(settled.actualLux === null, '多段结算不写单一照度字段（以分段为准）');
+  ok(r.json.version === vStarted + 1, '多段结算成功后版本 +1');
+  const w3After = r.json.artworks.find((a) => a.id === 3);
+  ok(w3After.used >= 16800, '作品已用量按多段总量计入');
+
+  // 12.4 已结束时段不能再 settle
+  r = await call('POST', `/api/slots/${mSlotId}/settle`, {
+    version: r.json.version,
+    actualStart: '2026-10-15T10:00', actualEnd: '2026-10-15T12:00',
+    segments: [{ start: '2026-10-15T10:00', end: '2026-10-15T12:00', lux: 1 }],
+  });
+  ok(r.status === 422 && r.json.error?.code === 'NOT_RUNNING', '已结束时段不能再次多段结算');
+
+  // ---------- 本轮：已结束时段分段更正 ----------
+  console.log('# 13. 已结束时段分段更正：理由/版本/分段校验，更正前后曝光留痕，新总量替换旧总量');
+  st = await getState();
+  // slot 1：seed 单一照度结算（09-29 09:10~11:50 140lux = 22400），W1 展出
+  // 13.1 缺理由
+  r = await call('POST', '/api/slots/1/correct', {
+    version: st.version,
+    segments: [{ start: '2026-09-29T09:10', end: '2026-09-29T11:50', lux: 140 }],
+  });
+  ok(r.status === 422 && r.json.error?.code === 'VALIDATION', '更正缺理由被拒绝');
+  // 13.2 分段不覆盖原区间
+  r = await call('POST', '/api/slots/1/correct', {
+    version: st.version, reason: '试填',
+    segments: [{ start: '2026-09-29T09:10', end: '2026-09-29T11:00', lux: 140 }],
+  });
+  ok(r.status === 422 && r.json.error?.code === 'SEGMENTS_INVALID', '更正分段未完整覆盖原实际区间被整批拒绝');
+  // 13.3 过期版本
+  r = await call('POST', '/api/slots/1/correct', {
+    version: 1, reason: '试填',
+    segments: [{ start: '2026-09-29T09:10', end: '2026-09-29T11:50', lux: 140 }],
+  });
+  ok(r.status === 409 && r.json.state.version === st.version, '更正过期版本返回 409 与最新预算');
+  // 失败均不改变总量与版本
+  const st2 = await getState();
+  const s1before = st2.slots.find((s) => s.id === 1);
+  ok(st2.version === st.version && s1before.actualExposure === 22400 && s1before.corrections.length === 0,
+     '更正失败不改变结算、分段与版本');
+  // 13.4 非 finished 时段不能更正
+  r = await call('POST', `/api/slots/${mSlotId + 1000}/correct`, { version: st.version, reason: 'x', segments: [] });
+  ok(r.status === 404, '更正不存在时段返回 404');
+
+  // 13.5 合法更正：140 整段(22400) -> 两段 60×100 + 100×150 = 21000
+  r = await call('POST', '/api/slots/1/correct', {
+    version: st.version,
+    reason: '照度计复核：开场一小时 100 lux，之后恢复 150 lux',
+    segments: [
+      { start: '2026-09-29T09:10', end: '2026-09-29T10:10', lux: 100 },
+      { start: '2026-09-29T10:10', end: '2026-09-29T11:50', lux: 150 },
+    ],
+  });
+  ok(r.status === 200 && r.json.beforeExposure === 22400 && r.json.afterExposure === 21000,
+     `更正成功：${r.json.beforeExposure} -> ${r.json.afterExposure}（替换而非累加）`);
+  ok(r.json.correction && r.json.correction.before.exposure === 22400 &&
+     r.json.correction.after.exposure === 21000 && r.json.correction.after.segments.length === 2 &&
+     r.json.correction.baseVersion === st.version && !!r.json.correction.createdAt && !!r.json.correction.reason,
+     '更正记录含更正前后曝光/时间、理由、版本、时间戳与分段快照');
+  const s1after = r.json.slots.find((s) => s.id === 1);
+  ok(s1after.actualSegments.length === 2 && s1after.corrections.length === 1 &&
+     s1after.actualStart === '2026-09-29T09:10' && s1after.actualEnd === '2026-09-29T11:50',
+     '时段展示新分段，原实际起止不变，更正历史 +1');
+  const w1UsedAfterCorrect = r.json.artworks.find((a) => a.id === 1).used;
+  st = await getState();
+  ok(Math.abs(st.artworks.find((a) => a.id === 1).used - w1UsedAfterCorrect) < 1e-6, '作品已用量按替换后的总量同步重算');
+
+  // 13.6 再次更正（回到更低值），历史累计两条；旧总量不重复计入
+  r = await call('POST', '/api/slots/1/correct', {
+    version: st.version,
+    reason: '设备校准后最终核定为全程 90 lux',
+    segments: [{ start: '2026-09-29T09:10', end: '2026-09-29T11:50', lux: 90 }],
+  });
+  ok(r.status === 200 && r.json.beforeExposure === 21000 && r.json.afterExposure === 14400,
+     `二次更正：${r.json.beforeExposure} -> ${r.json.afterExposure}`);
+  const s1two = r.json.slots.find((s) => s.id === 1);
+  ok(s1two.corrections.length === 2 && s1two.actualSegments.length === 1,
+     '更正历史累计 2 条，当前分段为最新一次提交');
+  const w1Two = r.json.artworks.find((a) => a.id === 1).used;
+  st = await getState();
+  const w1Expect = 12000 + 14400 + (72000) /* slot2 已在 #8 按 72000 结算 */;
+  ok(Math.abs(st.artworks.find((a) => a.id === 1).used - w1Expect) < 1e-6,
+     `多次更正后 W1 已用 = 既有 + 各已结束时段最新总量（${w1Expect}），无重复累计`);
+
+  // ---------- 本轮：更正触发后续时段不可启动重算 ----------
+  console.log('# 14. 向上更正导致超量：同步重算后续时段不可启动状态与缺口，下调后解除');
+  // 此时 W1：used=98400（12000 + slot1 的14400 + slot2 的72000），
+  // 另有进行中冻结预占 10800（#9 启动的 2026-10-01 时段 60分×180），可用 10800。
+  // g1 需 6000（放入后余 4800），g2 需 6000（更正前缺口1200？——实际预算校验按总量 21600 允许，
+  // 但贪婪核算逐时段占用：10800 先给 g1 后余 4800，g2 即缺口 1200）。
+  // 故更正前取 g1=6000 单段可启动、再加一条 4000 的 g2 均可启动（合计 10000 <= 10800）。
+  st = await getState();
+  r = await call('POST', '/api/schedule', { version: st.version, slots: [
+    { cid: 'g1', hall: '七号厅', start: '2026-11-05T09:00', end: '2026-11-05T10:00', lux: 100, artworkIds: [1] }, // 6000
+    { cid: 'g2', hall: '七号厅', start: '2026-11-06T09:00', end: '2026-11-06T09:40', lux: 100, artworkIds: [1] }, // 4000
+  ]});
+  ok(r.status === 200 && r.json.slots.filter((s) => s.status === 'scheduled').every((s) => !s.blocked),
+     '更正前预算充足，后续时段均可启动');
+  // 向上更正 slot1：14400 -> 22400（+8000）。可用余量 10800-8000=2800；
+  // g1 需 6000 即缺口 3200，g2 顺延继续被标。
+  r = await call('POST', '/api/slots/1/correct', {
+    version: r.json.version,
+    reason: '复核：实际照度高于初值',
+    segments: [{ start: '2026-09-29T09:10', end: '2026-09-29T11:50', lux: 140 }],
+  });
+  ok(r.status === 200, '向上更正成功');
+  const blockedAfter = r.json.blockedAfterFinish || [];
+  const blk2 = r.json.slots.find((s) => s.plannedStart.startsWith('2026-11-06'));
+  const blk1 = r.json.slots.find((s) => s.plannedStart.startsWith('2026-11-05'));
+  ok(blk1.blocked && blk2.blocked && blockedAfter.length === 2, '更正后按开始顺序重算：预算不足的后续时段均被标不可启动');
+  const gap = blk1.blockedReason.gaps[0];
+  ok(gap && gap.artworkId === 1 && gap.gap === 3200 && gap.has === 2800 && gap.need === 6000,
+     `更正后缺口数据正确（has=${gap?.has}, need=${gap?.need}, gap=${gap?.gap}）`);
+  r = await call('POST', `/api/slots/${blk1.id}/start`);
+  ok(r.status === 422 && r.json.error?.code === 'BLOCKED', '更正导致的不可启动时段禁止启动');
+  // 下调更正解除
+  st = await getState();
+  r = await call('POST', '/api/slots/1/correct', {
+    version: st.version,
+    reason: '再次校准，恢复低值',
+    segments: [{ start: '2026-09-29T09:10', end: '2026-09-29T11:50', lux: 90 }],
+  });
+  ok(r.status === 200 && (r.json.blockedAfterFinish || []).length === 0, '下调更正后缺口消除、后续时段恢复可启动');
+
+  // ---------- 本轮：旧单一照度 finish 语义保持 ----------
+  console.log('# 15. 旧 POST /finish（actualStart/End/Lux）单一照度结算语义保持');
+  st = await getState();
+  r = await call('POST', '/api/schedule', { version: st.version, slots: [
+    { cid: 'leg', hall: '八号厅', start: '2026-12-10T09:00', end: '2026-12-10T10:00', lux: 100, artworkIds: [3] },
+  ]});
+  const legId = r.json.slots.find((s) => s.plannedStart.startsWith('2026-12-10')).id;
+  r = await call('POST', `/api/slots/${legId}/start`);
+  ok(r.status === 200, '旧链路：时段启动（不需要版本）');
+  r = await call('POST', `/api/slots/${legId}/finish`, {
+    actualStart: '2026-12-10T09:05', actualEnd: '2026-12-10T10:20', actualLux: 60,
+  });
+  ok(r.status === 200 && r.json.justFinishedExposure === 4500 && Array.isArray(r.json.blockedAfterFinish),
+     `旧 finish 行为不变：75 分×60 = ${r.json.justFinishedExposure}，返回 justFinishedExposure/blockedAfterFinish（无需版本）`);
+  const leg = r.json.slots.find((s) => s.id === legId);
+  ok(leg.actualLux === 60 && leg.actualSegments.length === 1 && leg.actualSegments[0].lux === 60,
+     '旧单一照度结算在分段视图中合成单段展示');
+
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

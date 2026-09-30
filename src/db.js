@@ -52,6 +52,48 @@ CREATE TABLE IF NOT EXISTS slot_artworks (
   artwork_id INTEGER NOT NULL REFERENCES artworks(id) ON DELETE CASCADE,
   PRIMARY KEY (slot_id, artwork_id)
 );
+
+-- 实际照度分段（多段结算 / 分段更正）：各段首尾衔接、无重叠、完整覆盖实际区间。
+-- 曝光 = Σ(段分钟 × 段照度)，与 slots.actual_exposure 总量一致。
+-- 旧的单一照度结算（finish）不在此表留痕，读取时由 actual_start/end/lux 合成单段。
+CREATE TABLE IF NOT EXISTS slot_segments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+  seg_index INTEGER NOT NULL,                 -- 从 1 开始，按时间顺序
+  seg_start TEXT NOT NULL,
+  seg_end TEXT NOT NULL,
+  lux REAL NOT NULL CHECK (lux >= 0),
+  exposure REAL NOT NULL CHECK (exposure >= 0),
+  UNIQUE (slot_id, seg_index)
+);
+
+-- 已结束时段的分段更正记录：更正前后的实际起止、曝光总量与理由（新总量替换旧总量，不重复累计）
+CREATE TABLE IF NOT EXISTS slot_corrections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+  reason TEXT NOT NULL,
+  before_start TEXT NOT NULL,
+  before_end TEXT NOT NULL,
+  before_exposure REAL NOT NULL,
+  after_start TEXT NOT NULL,
+  after_end TEXT NOT NULL,
+  after_exposure REAL NOT NULL,
+  base_version INTEGER NOT NULL,              -- 发起更正时携带的版本
+  created_at TEXT NOT NULL                    -- ISO 时间戳
+);
+CREATE INDEX IF NOT EXISTS idx_slot_corrections_slot ON slot_corrections(slot_id, id);
+
+-- 每次更正提交的“更正后分段”快照
+CREATE TABLE IF NOT EXISTS slot_correction_segments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  correction_id INTEGER NOT NULL REFERENCES slot_corrections(id) ON DELETE CASCADE,
+  seg_index INTEGER NOT NULL,
+  seg_start TEXT NOT NULL,
+  seg_end TEXT NOT NULL,
+  lux REAL NOT NULL CHECK (lux >= 0),
+  exposure REAL NOT NULL CHECK (exposure >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_corr_segs_corr ON slot_correction_segments(correction_id, seg_index);
 `;
 
 function openDb() {

@@ -360,8 +360,163 @@ function finishSlot(db, id, body) {
   return tx.immediate();
 }
 
+// ---------- 多段照度结算 / 分段更正 ----------
+// 解析实际区间（actualStart/actualEnd），返回 {start, end} 或抛出 VALIDATION
+function parseActualSpan(body, prefix) {
+  const as = B.parseDateTime(body && body.actualStart, '实际开始时间');
+  const ae = B.parseDateTime(body && body.actualEnd, '实际结束时间');
+  if (as.error) throw new HttpError(422, 'VALIDATION', as.error);
+  if (ae.error) throw new HttpError(422, 'VALIDATION', ae.error);
+  if (ae.minutes <= as.minutes) {
+    throw new HttpError(422, 'VALIDATION', '时序无效：实际结束必须晚于实际开始');
+  }
+  return {
+    start: body.actualStart.trim(),
+    end: body.actualEnd.trim(),
+    startMin: as.minutes,
+    endMin: ae.minutes,
+  };
+}
+
+// 校验分段；不通过则整批拒绝（422 SEGMENTS_INVALID），不改变任何数据
+function requireSegments(body, span) {
+  const v = B.validateSegments(body && body.segments, {
+    minutes: span.startMin, text: span.start,
+  }, {
+    minutes: span.endMin, text: span.end,
+  });
+  if (v.errors) throw new HttpError(422, 'SEGMENTS_INVALID', '整批已拒绝：照度分段不合法（须首尾衔接、无重叠且完整覆盖实际区间）', {
+    errors: v.errors,
+  });
+  return v.segments;
+}
+
+// 整批替换某时段的分段（调用方须在事务内）
+function replaceSegments(db, slotId, segments) {
+  db.prepare('DELETE FROM slot_segments WHERE slot_id = ?').run(slotId);
+  const ins = db.prepare(`
+    INSERT INTO slot_segments (slot_id, seg_index, seg_start, seg_end, lux, exposure)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  segments.forEach((s, i) => ins.run(slotId, i + 1, s.start, s.end, s.lux, s.exposure));
+}
+
+function blockedAfterMutation(state) {
+  return state.slots
+    .filter((s) => s.status === 'scheduled' && s.blocked)
+    .sort((a, b) => a.seq - b.seq);
+}
+
+// 进行中时段：按实际起止 + 多段照度完成结算。必须携带当前版本（过期 409 + 最新预算）。
+// Σ(段分钟×照度) 作为实际曝光，替换该时段预占；分段不合法则整批拒绝，结算与版本均不变。
+function settleSlot(db, id, body) {
+  const tx = db.transaction(() => {
+    requireVersion(db, body);
+    const span = parseActualSpan(body);
+    const segments = requireSegments(body, span);
+    const exposure = B.sumSegmentExposure(segments);
+
+    const slot = db.prepare('SELECT * FROM slots WHERE id = ?').get(id);
+    if (!slot) throw new HttpError(404, 'NOT_FOUND', `时段 #${id} 不存在`);
+    if (slot.status !== 'running') {
+      throw new HttpError(422, 'NOT_RUNNING', `时段 #${id} 当前状态为 ${slot.status}，仅进行中时段可以多段结算`);
+    }
+
+    db.prepare(`
+      UPDATE slots SET status = 'finished',
+        actual_start = ?, actual_end = ?, actual_lux = NULL, actual_exposure = ?
+      WHERE id = ?
+    `).run(span.start, span.end, exposure, id);
+    replaceSegments(db, id, segments);
+
+    B.recomputeBlocked(db);
+    B.bumpVersion(db);
+    const state = B.summarize(db);
+    const settled = state.slots.find((s) => s.id === id) || null;
+    return {
+      ...state,
+      justFinishedExposure: exposure,
+      justFinishedSegments: settled ? settled.actualSegments : segments,
+      blockedAfterFinish: blockedAfterMutation(state),
+    };
+  });
+  return tx.immediate();
+}
+
+// 已结束时段：按“原实际起止 + 作品提交带理由的完整分段”更正。
+// 新总量替换旧总量（不重复累计），同步重算作品已用量、后续不可启动状态与缺口；
+// 记录更正前后的实际起止、曝光与理由。必须携带当前版本。
+function correctSlot(db, id, body) {
+  const tx = db.transaction(() => {
+    const baseVersion = requireVersion(db, body);
+
+    const reason = body && typeof body.reason === 'string' ? body.reason.trim() : '';
+    if (!reason) {
+      throw new HttpError(422, 'VALIDATION', '更正必须填写理由（reason）', { field: 'reason' });
+    }
+    if (reason.length > 200) {
+      throw new HttpError(422, 'VALIDATION', '更正理由过长（最多 200 字）', { field: 'reason' });
+    }
+
+    const slot = db.prepare('SELECT * FROM slots WHERE id = ?').get(id);
+    if (!slot) throw new HttpError(404, 'NOT_FOUND', `时段 #${id} 不存在`);
+    if (slot.status !== 'finished') {
+      throw new HttpError(422, 'NOT_FINISHED', `时段 #${id} 当前状态为 ${slot.status}，仅已结束时段可以分段更正`);
+    }
+
+    // 沿用原实际起止（更正只改分段照度，不允许改区间）；完整分段必须覆盖原区间
+    const span = {
+      start: slot.actual_start,
+      end: slot.actual_end,
+      startMin: B.parseDateTime(slot.actual_start).minutes,
+      endMin: B.parseDateTime(slot.actual_end).minutes,
+    };
+    const segments = requireSegments(body, span);
+    const newExposure = B.sumSegmentExposure(segments);
+    const beforeExposure = B.round3(slot.actual_exposure || 0);
+
+    db.prepare('UPDATE slots SET actual_exposure = ? WHERE id = ?').run(newExposure, id);
+    replaceSegments(db, id, segments);
+    db.prepare(`
+      INSERT INTO slot_corrections
+        (slot_id, reason, before_start, before_end, before_exposure,
+         after_start, after_end, after_exposure, base_version, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id, reason,
+      slot.actual_start, slot.actual_end, beforeExposure,
+      span.start, span.end, newExposure, baseVersion,
+      new Date().toISOString()
+    );
+    // 更正记录携带本次“更正后分段”快照，历史记录可逐次还原
+    const correctionId = db.prepare('SELECT last_insert_rowid() AS id').get().id;
+    const insCorrSeg = db.prepare(`
+      INSERT INTO slot_correction_segments
+        (correction_id, seg_index, seg_start, seg_end, lux, exposure)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    segments.forEach((s, i) => insCorrSeg.run(correctionId, i + 1, s.start, s.end, s.lux, s.exposure));
+
+    B.recomputeBlocked(db);
+    B.bumpVersion(db);
+    const state = B.summarize(db);
+    const corrected = state.slots.find((s) => s.id === id) || null;
+    const record = corrected && corrected.corrections.length
+      ? corrected.corrections[corrected.corrections.length - 1]
+      : null;
+    return {
+      ...state,
+      correction: record,
+      beforeExposure,
+      afterExposure: newExposure,
+      blockedAfterFinish: blockedAfterMutation(state),
+    };
+  });
+  return tx.immediate();
+}
+
 module.exports = {
   HttpError, readBody, parseId,
   createArtwork, updateArtwork, deleteArtwork,
-  replaceSchedule, startSlot, finishSlot,
+  replaceSchedule, startSlot, finishSlot, settleSlot, correctSlot,
 };

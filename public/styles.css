@@ -161,12 +161,39 @@ td.cell-expo { font-family: var(--mono); font-size: 12.5px; white-space: nowrap;
   padding: 22px 24px;
   box-shadow: 0 18px 50px rgba(0,0,0,.25);
 }
+.modal-wide { width: 720px; }
 .modal h3 { font-size: 16px; margin-bottom: 16px; }
 .form-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .form-row label { width: 170px; color: var(--muted); font-size: 13px; flex-shrink: 0; }
 .form-row input { flex: 1; min-width: 0; }
 .form-row.computed { justify-content: flex-end; font-size: 13px; color: var(--muted); }
 .form-row.computed strong { color: var(--primary); font-family: var(--mono); font-size: 15px; }
+
+/* 分段照度编辑器 */
+.seg-toggle { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 13px; width: auto !important; }
+.seg-toggle input { flex: 0 0 auto; }
+.seg-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  margin: 6px 0 8px; color: var(--muted); font-size: 12.5px;
+}
+.seg-head label { width: auto; }
+.seg-row {
+  display: flex; align-items: center; gap: 7px; margin-bottom: 8px; flex-wrap: nowrap;
+}
+.seg-row .seg-no {
+  flex: 0 0 20px; height: 22px; line-height: 22px; text-align: center;
+  background: #eef3f9; border-radius: 50%; font-size: 11.5px; color: var(--primary);
+}
+.seg-row input[type="datetime-local"] { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12.5px; }
+.seg-row input[type="number"] { flex: 0 0 92px; }
+.seg-row .seg-arrow { color: var(--muted); flex: 0 0 auto; }
+
+.mono-span { font-family: var(--mono); font-size: 12px; color: var(--text); line-height: 1.55; }
+.seg-cover { font-weight: 600; margin-bottom: 3px; }
+.seg-line { padding: 2px 0 2px 10px; border-left: 2px solid #cfe0f0; margin-bottom: 3px; }
+.seg-min { display: inline-block; margin-left: 6px; color: var(--muted); font-size: 11px; font-weight: 400; }
+.seg-total { font-weight: 700; }
+.cr-span { flex: 1; font-size: 12.5px; color: var(--muted); }
 .form-error {
   background: var(--danger-bg); border: 1px solid #ecc4be;
   color: var(--danger); padding: 9px 12px; border-radius: 8px;

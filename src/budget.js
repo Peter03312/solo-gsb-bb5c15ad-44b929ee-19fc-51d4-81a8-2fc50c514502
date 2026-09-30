@@ -71,7 +71,90 @@ function actualExposure(slot) {
   return round3(mins * slot.actual_lux);
 }
 
-function slotDto(slot, artworksById) {
+// ---------- 实际照度分段 ----------
+// 读取全部时段的分段记录；旧的单一照度结算时段没有分段，读取时由 actual_start/end/lux 合成单段。
+function loadSegments(db) {
+  const rows = db.prepare(`
+    SELECT slot_id, seg_index, seg_start, seg_end, lux, exposure
+    FROM slot_segments ORDER BY slot_id, seg_index
+  `).all();
+  const bySlot = new Map();
+  for (const r of rows) {
+    if (!bySlot.has(r.slot_id)) bySlot.set(r.slot_id, []);
+    bySlot.get(r.slot_id).push(r);
+  }
+  return bySlot;
+}
+
+function segmentDto(seg, idx = null) {
+  const minutes = minutesBetween(seg.seg_start, seg.seg_end);
+  return {
+    index: idx != null ? idx : seg.seg_index,
+    start: seg.seg_start,
+    end: seg.seg_end,
+    minutes: minutes === null ? null : minutes,
+    lux: seg.lux,
+    exposure: seg.exposure,
+  };
+}
+
+// 一个已结算时段“生效中”的分段：有分段记录用记录，否则用单一照度结算值合成一段
+function effectiveSegments(slot, segMap) {
+  const rows = segMap.get(slot.id);
+  if (rows && rows.length) return rows.map((r, i) => segmentDto(r, i + 1));
+  if (slot.actual_start != null && slot.actual_end != null && slot.actual_lux != null) {
+    const minutes = minutesBetween(slot.actual_start, slot.actual_end);
+    if (minutes !== null && minutes >= 0) {
+      return [{
+        index: 1,
+        start: slot.actual_start,
+        end: slot.actual_end,
+        minutes,
+        lux: slot.actual_lux,
+        exposure: round3(minutes * slot.actual_lux),
+      }];
+    }
+  }
+  return [];
+}
+
+function loadCorrections(db) {
+  const rows = db.prepare(`
+    SELECT id, slot_id, reason, before_start, before_end, before_exposure,
+           after_start, after_end, after_exposure, base_version, created_at
+    FROM slot_corrections ORDER BY slot_id, id
+  `).all();
+  const segRows = db.prepare(`
+    SELECT correction_id, seg_index, seg_start, seg_end, lux, exposure
+    FROM slot_correction_segments ORDER BY correction_id, seg_index
+  `).all();
+  const segsByCorr = new Map();
+  for (const r of segRows) {
+    if (!segsByCorr.has(r.correction_id)) segsByCorr.set(r.correction_id, []);
+    segsByCorr.get(r.correction_id).push(segmentDto(r, r.seg_index));
+  }
+  const bySlot = new Map();
+  for (const r of rows) {
+    if (!bySlot.has(r.slot_id)) bySlot.set(r.slot_id, []);
+    bySlot.get(r.slot_id).push({
+      id: r.id,
+      slotId: r.slot_id,
+      reason: r.reason,
+      before: { start: r.before_start, end: r.before_end, exposure: r.before_exposure },
+      after: {
+        start: r.after_start,
+        end: r.after_end,
+        exposure: r.after_exposure,
+        segments: segsByCorr.get(r.id) || [],
+      },
+      baseVersion: r.base_version,
+      createdAt: r.created_at,
+    });
+  }
+  return bySlot;
+}
+
+function slotDto(slot, artworksById, segMap = null, corrMap = null) {
   const planned = plannedExposure(slot);
   const actual = slot.status === 'finished' ? slot.actual_exposure : actualExposure(slot);
   let blockedReason = null;
@@ -91,6 +174,8 @@ function slotDto(slot, artworksById) {
     actualLux: slot.actual_lux,
     actualMinutes: actual === null ? null : minutesBetween(slot.actual_start, slot.actual_end),
     actualExposure: actual,
+    actualSegments: (segMap ? effectiveSegments(slot, segMap) : []),
+    corrections: (corrMap && corrMap.get(slot.id)) || [],
     blocked: !!slot.blocked,
     blockedReason,
     artworks: slot.artworkIds.map((id) => {
@@ -104,6 +189,8 @@ function slotDto(slot, artworksById) {
 function summarize(db) {
   const artworks = loadArtworks(db);
   const slots = loadSlots(db);
+  const segMap = loadSegments(db);
+  const corrMap = loadCorrections(db);
   const artworksById = new Map(artworks.map((a) => [a.id, a]));
 
   const acc = new Map();
@@ -148,8 +235,75 @@ function summarize(db) {
   return {
     version: db.prepare('SELECT version FROM meta WHERE id = 1').get().version,
     artworks: artworkDtos,
-    slots: slots.map((s) => slotDto(s, artworksById)),
+    slots: slots.map((s) => slotDto(s, artworksById, segMap, corrMap)),
   };
+}
+
+// ---------- 实际照度分段校验 ----------
+// 要求：非空数组；每段 start/end 为合法时间、end 晚于 start、lux 非负；
+// 各段按提交顺序首尾衔接（前一段 end 必须等于后一段 start）、无重叠，
+// 且完整覆盖 [actualStart, actualEnd]。任一不满足返回错误列表（整批拒绝）。
+// 通过时返回规范化分段 [{start, end, minutes, lux, exposure}]。
+function validateSegments(segments, spanStart, spanEnd) {
+  const errors = [];
+  if (!Array.isArray(segments) || segments.length === 0) {
+    return { errors: ['照度分段必须为非空数组，每段包含 start、end 与非负 lux'] };
+  }
+  const parsed = [];
+  segments.forEach((raw, i) => {
+    const where = `第 ${i + 1} 段`;
+    const s = parseDateTime(raw && raw.start, `${where} 开始时间`);
+    const e = parseDateTime(raw && raw.end, `${where} 结束时间`);
+    let bad = false;
+    if (s.error) { errors.push(s.error); bad = true; }
+    if (e.error) { errors.push(e.error); bad = true; }
+    if (!bad && e.minutes <= s.minutes) {
+      errors.push(`${where}：时序无效，结束时间必须晚于开始时间`);
+      bad = true;
+    }
+    const lux = Number(raw && raw.lux);
+    if (!isNonNegNumber(lux)) {
+      errors.push(`${where}：照度必须为非负数值`);
+      bad = true;
+    }
+    // 非法段保留占位（可能缺分钟），以便继续检测衔接/覆盖；最终有错误即整批拒绝
+    parsed.push(bad ? null : {
+      start: raw.start.trim(), end: raw.end.trim(),
+      startMin: s.minutes, endMin: e.minutes, lux,
+    });
+  });
+  // 段内错误不中断：非法段置 null，仍对可解析分段做衔接/覆盖检查，把问题一次性返回
+  const valid = parsed.filter(Boolean);
+  // 排序/衔接/覆盖：按提交顺序，第一段必须从区间起点开始，逐段首尾衔接，最后一段结束于区间终点
+  if (valid.length && valid[0].startMin !== spanStart.minutes) {
+    errors.push(`分段未从实际开始时间开始：首段起点 ${valid[0].start}，实际开始 ${spanStart.text}`);
+  }
+  for (let i = 1; i < valid.length; i++) {
+    const prev = valid[i - 1], cur = valid[i];
+    if (cur.startMin < prev.endMin) {
+      errors.push(`分段在 ${cur.start} 附近存在重叠，分段必须首尾衔接、无重叠`);
+    } else if (cur.startMin > prev.endMin) {
+      errors.push(`分段在 ${prev.end} 与 ${cur.start} 之间存在缺口，分段必须首尾衔接`);
+    }
+  }
+  if (valid.length && valid[valid.length - 1].endMin !== spanEnd.minutes) {
+    errors.push(`分段未覆盖到实际结束时间：末段终点 ${valid[valid.length - 1].end}，实际结束 ${spanEnd.text}`);
+  }
+  if (errors.length || valid.length !== parsed.length) return { errors };
+
+  return {
+    segments: parsed.map((p, i) => ({
+      start: p.start,
+      end: p.end,
+      minutes: p.endMin - p.startMin,
+      lux: p.lux,
+      exposure: round3((p.endMin - p.startMin) * p.lux),
+    })),
+  };
+}
+
+function sumSegmentExposure(segments) {
+  return round3(segments.reduce((sum, s) => sum + s.exposure, 0));
 }
 
 // ---------- 预算核算：按开始时间/编号顺序标记不可启动的时段 ----------
@@ -218,8 +372,13 @@ module.exports = {
   isNonNegNumber,
   loadArtworks,
   loadSlots,
+  loadSegments,
+  loadCorrections,
+  effectiveSegments,
   plannedExposure,
   actualExposure,
+  validateSegments,
+  sumSegmentExposure,
   summarize,
   recomputeBlocked,
   bumpVersion,
